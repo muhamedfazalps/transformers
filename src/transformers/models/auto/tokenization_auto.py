@@ -63,6 +63,7 @@ REGISTERED_FAST_ALIASES: dict[str, type[Any]] = {}
 
 TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
     [
+        ("EvollaModel", "TokenizersBackend" if is_tokenizers_available() else None),
         ("aimv2", "CLIPTokenizer" if is_tokenizers_available() else None),
         ("albert", "AlbertTokenizer" if is_tokenizers_available() else None),
         ("align", "BertTokenizer" if is_tokenizers_available() else None),
@@ -115,7 +116,6 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("emu3", "GPT2Tokenizer" if is_tokenizers_available() else None),
         ("ernie", "BertTokenizer" if is_tokenizers_available() else None),
         ("esm", "EsmTokenizer"),
-        ("EvollaModel", "TokenizersBackend" if is_tokenizers_available() else None),
         ("falcon_mamba", "GPTNeoXTokenizer" if is_tokenizers_available() else None),
         ("fastspeech2_conformer", "FastSpeech2ConformerTokenizer" if is_g2p_en_available() else None),
         ("flaubert", "FlaubertTokenizer"),
