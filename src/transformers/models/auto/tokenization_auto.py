@@ -158,7 +158,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("hubert", "Wav2Vec2CTCTokenizer"),
         ("ibert", "RobertaTokenizer"),
         ("idefics", "LlamaTokenizer" if is_tokenizers_available() else None),
-        ("idefics2", "TokenizersBackend" if is_tokenizers_available() else None),
+        ("idefics2", "LlamaTokenizer" if is_tokenizers_available() else None),
         ("instructblip", "TokenizersBackend" if is_tokenizers_available() else None),
         ("instructblipvideo", "TokenizersBackend" if is_tokenizers_available() else None),
         ("internvl", "Qwen2Tokenizer" if is_tokenizers_available() else None),
@@ -364,6 +364,7 @@ MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS: set[str] = {
     "ernie4_5_moe",
     "fuyu",
     "h2ovl_chat",
+    "hyperclovax",
     "hyperclovax_vlm",
     "internlm2",
     "internvl_chat",
@@ -719,6 +720,15 @@ class AutoTokenizer:
                 tokenizer_auto_map = tokenizer_config["auto_map"]
             else:
                 tokenizer_auto_map = tokenizer_config["auto_map"].get("AutoTokenizer", None)
+
+        # deepseek-r1 distills use model_type="llama" and tokenizer_class="LlamaTokenizer" but need TokenizersBackend. Hub really needs to be updated
+        _config_name_or_path = (getattr(config, "_name_or_path", None) or "").lower()
+        if (
+            tokenizer_auto_map is None
+            and TokenizersBackend is not None
+            and _config_name_or_path.startswith("deepseek-ai/deepseek-r1")
+        ):
+            return TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
 
         # if there is a config, we can check that the tokenizer class != than model class.
         # Use the config class if it's a specialized tokenizer, otherwise fall back to TokenizersBackend.
