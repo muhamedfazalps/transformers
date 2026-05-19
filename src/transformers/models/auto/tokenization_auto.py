@@ -732,14 +732,16 @@ class AutoTokenizer:
 
         # if there is a config, we can check that the tokenizer class != than model class.
         # Use the config class if it's a specialized tokenizer, otherwise fall back to TokenizersBackend.
+        # Hub class should prioritize tokenizer_config.json or fallback to config.tokenizer_class.
+        _hub_class = tokenizer_config_class or getattr(config, "tokenizer_class", None)
         if (
             tokenizer_auto_map is None
-            and tokenizer_config_class is not None
+            and _hub_class is not None
             and config_model_type is not None
             and config_model_type != ""
             and TOKENIZER_MAPPING_NAMES.get(config_model_type) is not None
             and (TOKENIZER_MAPPING_NAMES.get(config_model_type).removesuffix("Fast"))
-            != (tokenizer_config_class.removesuffix("Fast"))
+            != (_hub_class.removesuffix("Fast"))
         ):
             registered_class_name = TOKENIZER_MAPPING_NAMES.get(config_model_type).removesuffix("Fast")
             if registered_class_name not in (
@@ -755,7 +757,7 @@ class AutoTokenizer:
                         config_model_type in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
                         or config_model_name in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
                     )
-                    else tokenizer_config_class
+                    else _hub_class
                 )
                 tokenizer_class = tokenizer_class_from_name(class_name)
                 if tokenizer_class is not None and tokenizer_class.__name__ not in (
@@ -769,7 +771,7 @@ class AutoTokenizer:
                 return TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
 
             raise ValueError(
-                f"Tokenizer class '{tokenizer_config_class}' specified in the tokenizer config was not found. "
+                f"Tokenizer class '{_hub_class}' specified in the tokenizer config was not found. "
                 f"The tokenizer may need to be converted or re-saved."
             )
 
