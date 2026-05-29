@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from parameterized import parameterized
 
 import transformers
 from transformers import (
@@ -809,3 +810,26 @@ class NopConfig(PreTrainedConfig):
             mock_nllb.assert_called_once()
             mock_tb.assert_not_called()
             self.assertIs(result, mock_tokenizer)
+
+    TOKENIZERS_BACKEND_AUTO_MAPPING_CHECKPOINTS = [
+        "albert/albert-base-v2",
+        "almanach/camembert-base",
+        "google/rembert",
+        "facebook/xglm-564M",
+        "xlnet/xlnet-base-cased",
+    ]
+
+    @require_tokenizers
+    @parameterized.expand(TOKENIZERS_BACKEND_AUTO_MAPPING_CHECKPOINTS)
+    def test_eq(self, repo_id):
+        # PR #45936: v5 tokenizer auto mapping changes to use TokenizersBackend.
+        # Text contains U+200F (RIGHT-TO-LEFT MARK) which exposes ‏ handling
+        # differences between TokenizersBackend and slow tokenizer backends.
+        TOKENIZERS_BACKEND_AUTO_MAPPING_SHARED_TEXT = "روڈولف انڈرسن کہیں نہیں ملا‏، اس لیے ہے ہم نے صرف ایک ہی U2 لیا۔"
+
+        tokenizer_auto = AutoTokenizer.from_pretrained(repo_id)
+        tokenizer_tok = TokenizersBackend.from_pretrained(repo_id)
+        self.assertEqual(
+            tokenizer_tok(TOKENIZERS_BACKEND_AUTO_MAPPING_SHARED_TEXT, add_special_tokens=False)["input_ids"],
+            tokenizer_auto(TOKENIZERS_BACKEND_AUTO_MAPPING_SHARED_TEXT, add_special_tokens=False)["input_ids"],
+        )
