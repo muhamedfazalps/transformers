@@ -197,32 +197,17 @@ class PagedAttentionCache:
                 )
             self.num_key_value_heads //= tp_size
 
-        # Infer number of blocks and max batch tokens
-        page_size = self.head_dim * self.num_key_value_heads
-
-        if is_flash_attention_requested(self.config):
-            num_attention_masks = 0  # only used to compute the default memory footprint args
-        elif "sliding_attention" in group_types:
-            # TODO: when we generalize to allow for block-attn, we can use `num_attention_masks=sum(set(group_types))`
-            num_attention_masks = 2
-        else:
-            num_attention_masks = 1
-
         # If somehow the max memory percent is not yet resolved, resolve it conservatively
         if continuous_batching_config.max_memory_percent is None:
             resolve_max_memory_percent(cb_config=continuous_batching_config, has_logit_processors=True)
 
-        memory_handler = PagedAttentionMemoryHandler(
+        num_blocks, max_batch_tokens = PagedAttentionMemoryHandler(
             config=config,
             continuous_batching_config=continuous_batching_config,
             dtype=self.dtype,
-            page_size=page_size,
-            num_groups=self.num_groups,
+            group_types=group_types,
             group_size=group_size,
-            num_attention_masks=num_attention_masks,
-        )
-
-        num_blocks, max_batch_tokens = memory_handler.infer_num_blocks_and_max_batch_tokens()
+        ).infer_num_blocks_and_max_batch_tokens()
 
         # For TP, align num_blocks and max_batch_tokens to the minimal value across the TP group
         if tp_size > 1:
@@ -234,10 +219,7 @@ class PagedAttentionCache:
         self.num_blocks = num_blocks
         self.max_batch_tokens = max_batch_tokens
         self.num_pages = self.num_blocks * self.block_size
-        logger.info(
-            f"PagedAttentionCache initialized with {self.num_blocks = }, {self.block_size = }, {page_size = }, "
-            f"{self.max_batch_tokens = } {num_attention_masks = }"
-        )
+        logger.info(f"Paged cache initialized: {self.num_blocks = }, {self.block_size = }, {self.max_batch_tokens = }")
 
         # If max_blocks_per_request is not set, initialize it to the non-zero fallback value
         max_blocks_per_request = continuous_batching_config.max_blocks_per_request
@@ -574,10 +556,8 @@ class PagedAttentionMemoryHandler:
         config: PreTrainedConfig,
         continuous_batching_config: ContinuousBatchingConfig,
         dtype: torch.dtype,
-        page_size: int,
-        num_groups: int,
+        group_types: list[str],
         group_size: int,
-        num_attention_masks: int,
     ) -> None:
         """Initialize the memory handler. `activation_peaks` is a list of `(Δcn, Δcm)` pairs giving the activation memory
         contributions proportional to N (pages) and M (batch tokens) for each peak. Memory must satisfy the constraint
@@ -587,10 +567,16 @@ class PagedAttentionMemoryHandler:
         self.cache_dtype = dtype
         self.activation_dtype = dtype
         self.block_size = continuous_batching_config.block_size
-        self.page_size = page_size
-        self.num_groups = num_groups
+        self.page_size = find_head_dim(config) * find_num_kv_heads(config)
+        self.num_groups = len(group_types)
         self.group_size = group_size
-        self.num_attention_masks = num_attention_masks
+
+        # TODO: when we generalize to allow for block-attn, we can use `num_attention_masks=sum(set(group_types))`
+        if is_flash_attention_requested(self.config):
+            self.num_attention_masks = 0
+        else:
+            self.num_attention_masks = 2 if "sliding_attention" in group_types else 1
+
         self.max_blocks_per_request = continuous_batching_config.max_blocks_per_request
         if self.max_blocks_per_request is None:
             self.max_blocks_per_request = continuous_batching_config.fallback_max_blocks_per_request
@@ -601,24 +587,22 @@ class PagedAttentionMemoryHandler:
 
     @property
     def activation_peak(self) -> dict[str, tuple[int, ...]]:
+        mem_per_q_token = self.config.num_attention_heads * find_head_dim(self.config)
+        mem_per_k_or_v_token = self.page_size
         peaks = {}
 
         # LM head peak: this is when we turn the hidden states into logits
         delta_m = self.config.hidden_size * self.activation_dtype  # hidden_shape, shape [M, hidden_size]
         delta_m += self.config.vocab_size * torch.float32.itemsize  # logits, shape [M, V], always in fp32
-
         peaks["lm_head"] = (delta_m, 0, 0, 0)
 
-        # Solve for the attention peak: this is when we read the key and value states from the cache
-        mem_per_q_token = self.config.num_attention_heads * find_head_dim(self.config)
-        mem_per_k_or_v_token = self.page_size
-
-        delta_m = self.config.hidden_size  # hidden state, shape [M, hidden_size]
-        delta_m += mem_per_q_token  # q_projection, shape [M, mem_per_q_token]
-        delta_m += 2 * mem_per_k_or_v_token  # new K and V, shape [M, page_size]
-
+        # Attention peak: this is when we read the key and value states from the cache
+        delta_m = (
+            self.config.hidden_size  # hidden state, shape [M, hidden_size]
+            + mem_per_q_token  # q_projection, shape [M, mem_per_q_token]
+            + 2 * mem_per_k_or_v_token  # new K and V, shape [M, page_size]
+        )
         delta_n = 2 * mem_per_k_or_v_token  # old K and V, read from cache (worst case scenario: whole cache is read)
-
         peaks["attention"] = (delta_m, delta_n, 0, 0)
 
         return peaks
