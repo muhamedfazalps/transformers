@@ -201,25 +201,25 @@ class PagedAttentionCache:
         if continuous_batching_config.max_memory_percent is None:
             resolve_max_memory_percent(cb_config=continuous_batching_config, has_logit_processors=True)
 
-        num_blocks, max_batch_tokens = PagedAttentionMemoryHandler(
+        max_batch_tokens, num_blocks = PagedAttentionMemoryHandler(
             config=config,
             continuous_batching_config=continuous_batching_config,
             dtype=self.dtype,
             group_types=group_types,
             group_size=group_size,
-        ).infer_num_blocks_and_max_batch_tokens()
+        ).infer_max_batch_tokens_and_num_blocks()
 
-        # For TP, align num_blocks and max_batch_tokens to the minimal value across the TP group
+        # For TP, align max_batch_tokens and num_blocks to the minimal value across the TP group
         if tp_size > 1:
-            sync = torch.tensor([num_blocks, max_batch_tokens], device=self.device, dtype=torch.int64)
+            sync = torch.tensor([max_batch_tokens, num_blocks], device=self.device, dtype=torch.int64)
             distributed_helper.tp_all_reduce_min(sync)
-            num_blocks, max_batch_tokens = int(sync[0].item()), int(sync[1].item())
+            max_batch_tokens, num_blocks = int(sync[0].item()), int(sync[1].item())
 
         # Add the inferred attributes to the class
-        self.num_blocks = num_blocks
         self.max_batch_tokens = max_batch_tokens
+        self.num_blocks = num_blocks
         self.num_pages = self.num_blocks * self.block_size
-        logger.info(f"Paged cache initialized: {self.num_blocks = }, {self.block_size = }, {self.max_batch_tokens = }")
+        logger.info(f"Paged cache initialized: {self.max_batch_tokens = }, {self.num_blocks = }, {self.block_size = }")
 
         # If max_blocks_per_request is not set, initialize it to the non-zero fallback value
         max_blocks_per_request = continuous_batching_config.max_blocks_per_request
@@ -618,7 +618,7 @@ class PagedAttentionMemoryHandler:
         logger.info(f"Memory available for cache allocation: {available_memory // 1024**2} MB")
         return available_memory
 
-    def infer_num_blocks_and_max_batch_tokens(self) -> tuple[int, int]:
+    def infer_max_batch_tokens_and_num_blocks(self) -> tuple[int, int]:
         """Infers max_batch_tokens and num_blocks based on the available memory and the size of the activation peaks.
         If neither value is provided, we use a default value of 8192 for max_batch_tokens, apply bounds depending on the
         available VRAM, and solve for num_blocks. If one value is provided, the other is found using a linear solve."""
@@ -626,11 +626,11 @@ class PagedAttentionMemoryHandler:
         num_blocks = self.cb_config.num_blocks
 
         # If both values are provided, just make sure they make sense
-        if num_blocks is not None and max_batch_tokens is not None:
+        if max_batch_tokens is not None and num_blocks is not None:
             return self._check_footprint(max_batch_tokens, num_blocks)
 
         # If one or more value is provided, solve for the other
-        if num_blocks is not None or max_batch_tokens is not None:
+        if max_batch_tokens is not None or num_blocks is not None:
             max_batch_tokens, num_blocks = self._solve_for_peaks(
                 max_batch_tokens, num_blocks, cache_fill_per_batch=None
             )
@@ -682,10 +682,10 @@ class PagedAttentionMemoryHandler:
         cm, cn, cmn, cmm = self._equation_coefficients(peak)
 
         # If neither variable is defined, use a quadratic solver
-        if num_blocks is None and max_batch_tokens is None:
+        if max_batch_tokens is None and num_blocks is None:
             # Substitute M = m·N → (coeff_nm·m + coeff_mm·m²)·N² + (coeff_n + coeff_m·m)·N − avail = 0
             if m is None:
-                raise ValueError("m must be provided if num_blocks and max_batch_tokens are None")
+                raise ValueError("m must be provided if max_batch_tokens and num_blocks are None")
             num_pages = self._solve_quadratic(cmn * m + cmm * m**2, cn + cm * m, -self.available_memory)
             max_batch_tokens = int(num_pages * m)
             num_blocks = int(num_pages) // self.block_size
