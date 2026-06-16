@@ -584,6 +584,7 @@ class PagedAttentionMemoryHandler:
         self.num_output_rows = 2 if continuous_batching_config.return_logprobs else 1
         # This account for the set of 2 IOs if async batching is used
         self.io_multiplier = 2 if continuous_batching_config.use_async_batching else 1
+        self.available_memory = self.get_available_memory()
 
     @property
     def activation_peak(self) -> dict[str, tuple[int, ...]]:
@@ -620,40 +621,38 @@ class PagedAttentionMemoryHandler:
         """Infers max_batch_tokens and num_blocks based on the available memory and the size of the activation peaks.
         If neither value is provided, we use a default value of 8192 for max_batch_tokens, apply bounds depending on the
         available VRAM, and solve for num_blocks. If one value is provided, the other is found using a linear solve."""
-        available = self.get_available_memory()
         max_batch_tokens = self.cb_config.max_batch_tokens
         num_blocks = self.cb_config.num_blocks
 
         # If both values are provided, just make sure they make sense
         if num_blocks is not None and max_batch_tokens is not None:
-            return self._check_footprint(max_batch_tokens, num_blocks, available)
+            return self._check_footprint(max_batch_tokens, num_blocks)
 
         # If one or more value is provided, solve for the other
         if num_blocks is not None or max_batch_tokens is not None:
             max_batch_tokens, num_blocks = self._solve_for_peaks(
-                max_batch_tokens, num_blocks, available, cache_fill_per_batch=None)
-            return self._check_footprint(max_batch_tokens, num_blocks, available)
+                max_batch_tokens, num_blocks, cache_fill_per_batch=None
+            )
+            return self._check_footprint(max_batch_tokens, num_blocks)
 
         # If no value is provided, use the default value for max_batch_tokens w/ VRAM-based upper bound
         upper_bound_vram, _ = self._solve_for_peaks(
             max_batch_tokens=None,
             num_blocks=None,
-            available=available,
             cache_fill_per_batch=0.1,  # each cache must fill 10% of the cache at most
         )
         max_batch_tokens = min(self._default_max_batch_tokens, upper_bound_vram)
         max_batch_tokens = max(max_batch_tokens, self._min_max_batch_tokens)
         # Then solve with that value
         max_batch_tokens, num_blocks = self._solve_for_peaks(
-            max_batch_tokens, num_blocks, available, cache_fill_per_batch=None
+            max_batch_tokens, num_blocks, cache_fill_per_batch=None
         )
-        return self._check_footprint(max_batch_tokens, num_blocks, available)
+        return self._check_footprint(max_batch_tokens, num_blocks)
 
     def _solve_for_peaks(
         self,
         max_batch_tokens: int | None,
         num_blocks: int | None,
-        available: int,
         cache_fill_per_batch: float | None,
     ) -> tuple[int, int]:
         """Returns max_batch_tokens and num_blocks so that their memory footprint is within the available memory for all
@@ -663,7 +662,7 @@ class PagedAttentionMemoryHandler:
         solutions = []
 
         for peak_deltas in self.activation_peak.values():
-            m, n = self._solve_for_peak(peak_deltas, max_batch_tokens, num_blocks, available, cache_fill_per_batch)
+            m, n = self._solve_for_peak(peak_deltas, max_batch_tokens, num_blocks, cache_fill_per_batch)
             solutions.append((m, n))
 
         final_m = min([solution[0] for solution in solutions])
@@ -675,7 +674,6 @@ class PagedAttentionMemoryHandler:
         peak: tuple[int, int],
         max_batch_tokens: int | None,
         num_blocks: int | None,
-        available: int,
         m: float | None,
     ) -> tuple[int, int]:
         """Returns a couple of `(max_batch_tokens, num_blocks)` that satisfy the memory constraint for the given
@@ -687,27 +685,29 @@ class PagedAttentionMemoryHandler:
             # Substitute M = m·N → (coeff_nm·m + coeff_mm·m²)·N² + (coeff_n + coeff_m·m)·N − avail = 0
             if m is None:
                 raise ValueError("m must be provided if num_blocks and max_batch_tokens are None")
-            num_pages = self._solve_quadratic(cmn * m + cmm * m**2, cn + cm * m, -available)
+            num_pages = self._solve_quadratic(cmn * m + cmm * m**2, cn + cm * m, -self.available_memory)
             max_batch_tokens = int(num_pages * m)
 
         # Otherwise, use a linear solver
         elif num_blocks is None:
             # M given → linear in N: (coeff_n + coeff_nm·M)·N = avail − coeff_m·M − coeff_mm·M²
             M = max_batch_tokens
-            num_pages = floor((available - cm * M - cmm * M**2) / (cn + cmn * M))
+            num_pages = floor((self.available_memory - cm * M - cmm * M**2) / (cn + cmn * M))
 
         elif max_batch_tokens is None:
             # N given → quadratic in M: coeff_mm·M² + (coeff_m + coeff_nm·N)·M + (coeff_n·N − avail) = 0
             N = num_blocks * self.block_size
-            M = self._solve_quadratic(cmm, cm + cmn * N, cn * N - available)
+            M = self._solve_quadratic(cmm, cm + cmn * N, cn * N - self.available_memory)
 
         return max_batch_tokens, num_blocks
 
-    def _check_footprint(self, max_batch_tokens: int, num_blocks: int, available: int) -> tuple[int, int]:
+    def _check_footprint(self, max_batch_tokens: int, num_blocks: int) -> tuple[int, int]:
         """Checks if the footprint of the cache is within the available memory."""
         memory_footprint = self.compute_memory_footprint(max_batch_tokens, num_blocks)
-        if memory_footprint > available:
-            raise MemoryError(f"Memory footprint {memory_footprint} is more than available memory {available}")
+        if memory_footprint > self.available_memory:
+            raise MemoryError(
+                f"Memory footprint {memory_footprint} is more than available memory {self.available_memory}"
+            )
         return max_batch_tokens, num_blocks
 
     def _solve_quadratic(self, a: float, b: float, c: float) -> int:
