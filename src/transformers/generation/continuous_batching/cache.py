@@ -26,6 +26,23 @@ from .initialization import resolve_max_memory_percent
 from .requests import RequestState, RequestStatus, get_device_and_memory_breakdown, logger
 
 
+def find_num_kv_heads(config: PreTrainedConfig) -> int:
+    """Finds the number of key-value heads for the given config."""
+    for attr in ["num_key_value_heads", "num_attention_heads"]:
+        if hasattr(config, attr):
+            return getattr(config, attr)
+    raise ValueError(f"num_key_value_heads or num_attention_heads could not be found in the config:\n{config}")
+
+
+def find_head_dim(config: PreTrainedConfig) -> int:
+    """Finds the head dimension for the given config."""
+    if hasattr(config, "head_dim"):
+        return config.head_dim
+    if hasattr(config, "hidden_size") and hasattr(config, "num_attention_heads"):
+        return config.hidden_size // config.num_attention_heads
+    raise ValueError(f"head_dim or (hidden_size and num_attention_heads) could not be found in the config:\n{config}")
+
+
 def group_layers_by_attn_type(config: PreTrainedConfig) -> tuple[list[list[int]], list[str]]:
     """
     Group layers depending on the attention mix, according to VLLM's hybrid allocator rules:
@@ -134,17 +151,15 @@ class PagedAttentionCache:
             device: Device for the cache tensors
             distributed_helper: TP-aware helper. Used to dispatch attention heads and ensure coherent cache size
             tp_plan: Tensor parallelism plan
-            dtype: Data type of the cache
+            dtype: Data type of the activation and the cache (for now, these are the same)
         """
         self.config = config
         self.dtype = dtype
         self.device = device
 
         # Extract model dimensions
-        kv_heads = getattr(config, "num_key_value_heads", None)
-        self.num_key_value_heads: int = kv_heads if kv_heads is not None else config.num_attention_heads
-        head_dim = getattr(config, "head_dim", None)
-        self.head_dim: int = head_dim if head_dim is not None else config.hidden_size // config.num_attention_heads
+        self.num_key_value_heads: int = find_num_kv_heads(config)
+        self.head_dim: int = find_head_dim(config)
 
         # Extract cache dimensions. Default used to be 32, now it's 256 to be compatible with flash_with_kvcache.
         self.block_size = continuous_batching_config.block_size
@@ -218,8 +233,6 @@ class PagedAttentionCache:
         )
 
         num_blocks, max_batch_tokens = memory_handler.infer_num_blocks_and_max_batch_tokens(
-            num_blocks=continuous_batching_config.num_blocks,
-            max_batch_tokens=continuous_batching_config.max_batch_tokens,
             cache_dtype=self.dtype,
         )
 
@@ -552,23 +565,18 @@ class PagedAttentionCache:
             self.free_blocks(request_id)
 
 
-# TODO: rework computation with the groups and their sizes
 class PagedAttentionMemoryHandler:
-    """Determines the optimal number of pages (N) and max batch tokens (M) for the paged attention cache, given
+    """Determines the optimal max batch tokens (M) and number of blocks (N) for the paged attention cache, given
     available GPU memory. The relation between N and number of blocks is: num_blocks = N // block_size.
 
-    The memory footprint is a polynomial in N and M, where each term maps to a tensor allocated in
+    The memory footprint is a polynomial in M and N, where each term maps to a tensor allocated in
     ``ContinuousBatchingIOs._setup_static_tensors`` or ``PagedAttentionCache.__init__``:
 
-        memory(N, M)  =  coeff_n · N  +  coeff_m · M  +  coeff_nm · N·M  +  coeff_mm · M²
+        memory(M, N)  =  coeff_m · M  +  coeff_n · N  +  coeff_mn · M·N  +  coeff_mm · M²
 
     See ``_equation_coefficients`` for the breakdown.  All three solving modes (auto, fixed-N, fixed-M) reduce to
     solving this equation, which is at most quadratic in one variable.
     """
-
-    _activation_dtype = torch.bfloat16
-    _input_dtype = torch.int32
-    _upper_bound_num_blocks = 4096
 
     _min_max_batch_tokens = 256
     _default_max_batch_tokens = 8192
@@ -611,14 +619,14 @@ class PagedAttentionMemoryHandler:
 
     def infer_num_blocks_and_max_batch_tokens(
         self,
-        max_batch_tokens: int | None = None,
-        num_blocks: int | None = None,
         cache_dtype: torch.dtype = torch.float16,
     ) -> tuple[int, int]:
         """Infers max_batch_tokens and num_blocks based on the available memory and the size of the activation peaks.
         If neither value is provided, we use a default value of 8192 for max_batch_tokens, apply bounds depending on the
         available VRAM, and solve for num_blocks. If one value is provided, the other is found using a linear solve."""
         available = self.get_available_memory()
+        max_batch_tokens = self.cb_config.max_batch_tokens
+        num_blocks = self.cb_config.num_blocks
 
         # If both values are provided, just make sure they make sense
         if num_blocks is not None and max_batch_tokens is not None:
@@ -731,8 +739,8 @@ class PagedAttentionMemoryHandler:
         across peaks. Each addend is annotated with the tensor it corresponds to in
         `ContinuousBatchingIOs._setup_static_tensors` (or the forward pass, for activation terms).
         """
-        i = self._input_dtype.itemsize       # int32
-        a = self._activation_dtype.itemsize  # bfloat16
+        i = torch.int32.itemsize             # size of int32 in bytes, used for index, input_ids, ...
+        a = cache_dtype.itemsize             # for now, the cache and the activation have the same dtype
         c = cache_dtype.itemsize
         k = self.io_multiplier               # 1 sync, 2 async (IO tensors only)
         delta_n, delta_m = peak
