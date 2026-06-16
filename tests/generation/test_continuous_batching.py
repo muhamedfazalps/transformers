@@ -17,6 +17,7 @@ import gc
 import itertools
 import os
 import unittest
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -1405,93 +1406,127 @@ class TestMemoryHandlerPrediction(unittest.TestCase):
     """Verifies that ``PagedAttentionMemoryHandler.compute_memory_footprint`` matches real GPU memory usage.
 
     For each configuration we allocate tensors at the *idealized* sizes modeled by the handler (same shapes, same
-    dtypes, no alignment padding or extra blocks) and compare the CUDA memory delta to the handler's prediction.
+    dtypes, no alignment padding or extra blocks) and compare the CUDA memory delta to the handler's prediction. The
+    handler derives the page size and the two activation peaks (LM head and attention) from the model config, so we
+    allocate the tensors of whichever peak dominates -- that is the one ``compute_memory_footprint`` reports.
     """
-
-    # (block_size, page_size, num_groups, group_size, peak_act, num_attn_masks, max_bpr, logprobs, cache_dtype, use_async_batching)
-    CONFIGS = [
-        (32, 256, 1, 22, 34048, 1, 0, False, torch.float16, False),  # sdpa-like, 1 attn mask
-        (256, 256, 1, 22, 34048, 0, 0, False, torch.float16, False),  # flash-like, no attn mask
-        (32, 256, 2, 14, 34048, 2, 0, False, torch.bfloat16, False),  # hybrid model, 2 groups + 2 masks
-        (32, 128, 1, 16, 8192, 1, 8, True, torch.float16, False),  # with block_table + logprobs
-        (32, 128, 1, 16, 8192, 1, 8, True, torch.float16, True),  # with block_table + logprobs + async batching
-    ]
 
     NUM_BLOCKS = 4
     MAX_BATCH_TOKENS = 64
+
+    # Each tuple fully specifies a synthetic model config plus the CB knobs; page_size = head_dim * num_kv_heads.
+    # fmt: off
+    # (block_size, head_dim, num_kv_heads, num_attention_heads, hidden_size, vocab_size, group_types, group_size, attn_impl, max_bpr, logprobs, dtype, use_async)
+    CONFIGS = [
+        (32, 64, 4, 8, 512, 32000, ["full_attention"], 22, "sdpa", 0, False, torch.float16, False),  # sdpa-like, 1 mask
+        (256, 64, 4, 8, 512, 32000, ["full_attention"], 22, "flash_attention_2", 0, False, torch.float16, False),  # flash-like, no mask
+        (32, 64, 4, 8, 512, 32000, ["full_attention", "sliding_attention"], 14, "sdpa", 0, False, torch.bfloat16, False),  # hybrid, 2 groups + 2 masks
+        (32, 64, 2, 8, 512, 32000, ["full_attention"], 16, "sdpa", 8, True, torch.float16, False),  # block_table + logprobs
+        (32, 64, 2, 8, 512, 32000, ["full_attention"], 16, "sdpa", 8, True, torch.float16, True),  # block_table + logprobs + async
+    ]
+    # fmt: on
 
     @parameterized.expand(CONFIGS)
     def test_memory_prediction(
         self,
         block_size: int,
-        page_size: int,
-        num_groups: int,
+        head_dim: int,
+        num_kv_heads: int,
+        num_attention_heads: int,
+        hidden_size: int,
+        vocab_size: int,
+        group_types: list[str],
         group_size: int,
-        peak_act: int,
-        num_attn_masks: int,
+        attn_impl: str,
         max_bpr: int,
         logprobs: bool,
-        cache_dtype: torch.dtype,
-        use_async_batching: bool,
+        dtype: torch.dtype,
+        use_async: bool,
     ) -> None:
+        config = SimpleNamespace(  # rather than creating a full config that we would only use for the namespace
+            head_dim=head_dim,
+            num_key_value_heads=num_kv_heads,
+            num_attention_heads=num_attention_heads,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            _attn_implementation=attn_impl,
+        )
         cb_config = ContinuousBatchingConfig(
+            block_size=block_size,
             max_blocks_per_request=max_bpr,
             return_logprobs=logprobs,
-            use_async_batching=use_async_batching,
-            block_size=block_size,
+            use_async_batching=use_async,
+            max_memory_percent=0.9,
+        )
+        handler = PagedAttentionMemoryHandler(
+            config=config,
+            continuous_batching_config=cb_config,
+            dtype=dtype,
+            group_types=group_types,
+            group_size=group_size,
         )
 
-        handler = PagedAttentionMemoryHandler(
-            continuous_batching_config=cb_config,
-            page_size=page_size,
-            num_groups=num_groups,
-            group_size=group_size,
-            activation_peaks=[(0, peak_act)],
-            num_attention_masks=num_attn_masks,
-        )
+        num_groups = len(group_types)
+        num_attn_masks = handler.num_attention_masks
+        num_output_rows = 2 if logprobs else 1
+        page_size = head_dim * num_kv_heads
+        q_dim = num_attention_heads * head_dim
 
         N = self.NUM_BLOCKS * block_size  # num_pages
         M = self.MAX_BATCH_TOKENS
-        predicted = handler.compute_memory_footprint(self.NUM_BLOCKS, M, cache_dtype)
-        num_output_rows = 2 if logprobs else 1
-        act_dtype = handler._activation_dtype
-        i32 = handler._input_dtype
+        k = handler.io_multiplier  # 1 sync, 2 async -- scales IO tensors only
+        predicted = handler.compute_memory_footprint(M, self.NUM_BLOCKS)
 
         # -- Allocate tensors at the exact idealized sizes the handler models --
         device = "cuda"
         torch.cuda.empty_cache()
         baseline = torch.cuda.memory_allocated(device)
 
-        k = handler.io_multiplier  # 1 sync, 2 async -- scales IO tensors only
-        tensors = []
+        # Tensors present regardless of which activation peak is live
+        fixed = []
         # kv_cache: 2 * group_size tensors of [N, page_size] (not scaled by k)
         for _ in range(group_size):
-            tensors.append(torch.empty((N, page_size), dtype=cache_dtype, device=device))
-            tensors.append(torch.empty((N, page_size), dtype=cache_dtype, device=device))
-        # activation peak: flat tensor of peak_act * M elements (not scaled by k)
-        tensors.append(torch.empty(peak_act * M, dtype=act_dtype, device=device))
+            fixed.append(torch.empty((N, page_size), dtype=dtype, device=device))
+            fixed.append(torch.empty((N, page_size), dtype=dtype, device=device))
         # IO tensors below are allocated k times (once per IO instance)
         for _ in range(k):
-            # bulk_input: [7, M]
-            tensors.append(torch.empty((7, M), dtype=i32, device=device))
-            # output_ids: [num_output_rows, M]
-            tensors.append(torch.empty((num_output_rows, M), dtype=i32, device=device))
-            # attention_mask: [1, 1, M, N + M] per mask type
-            for _ in range(num_attn_masks):
-                tensors.append(torch.empty((1, 1, M, N + M), dtype=act_dtype, device=device))
-            # block_table: [num_groups, M, max_bpr] (empty when max_bpr == 0)
-            if max_bpr > 0:
-                tensors.append(torch.empty((num_groups, M, max_bpr), dtype=i32, device=device))
-            # write_index: [num_groups, M]
-            tensors.append(torch.empty((num_groups, M), dtype=torch.int64, device=device))
-            # read_index: [num_groups, N + M]
-            tensors.append(torch.empty((num_groups, N + M), dtype=torch.int64, device=device))
+            fixed.append(torch.empty((7, M), dtype=torch.int32, device=device))  # bulk_input
+            fixed.append(torch.empty((num_output_rows, M), dtype=torch.int32, device=device))  # output_ids
+            for _ in range(num_attn_masks):  # attention_mask: [1, 1, M, N + M] per mask type
+                fixed.append(torch.empty((1, 1, M, N + M), dtype=dtype, device=device))
+            if max_bpr > 0:  # block_table: [num_groups, M, max_bpr] (skipped when max_bpr == 0)
+                fixed.append(torch.empty((num_groups, M, max_bpr), dtype=torch.int32, device=device))
+            fixed.append(torch.empty((num_groups, M), dtype=torch.int64, device=device))  # write_index
+            fixed.append(torch.empty((num_groups, N + M), dtype=torch.int64, device=device))  # read_index
+
+        # Activation peaks: only one is live at a time, so the footprint uses whichever is larger
+        peaks = {
+            # LM head: hidden states [M, hidden] turned into logits [M, vocab] (always fp32)
+            "lm_head": [
+                torch.empty((M, hidden_size), dtype=dtype, device=device),
+                torch.empty((M, vocab_size), dtype=torch.float32, device=device),
+            ],
+            # Attention: hidden + Q + new K/V over M, plus old K/V read from the whole cache over N
+            "attention": [
+                torch.empty((M, hidden_size), dtype=dtype, device=device),
+                torch.empty((M, q_dim), dtype=dtype, device=device),
+                torch.empty((M, page_size), dtype=dtype, device=device),
+                torch.empty((M, page_size), dtype=dtype, device=device),
+                torch.empty((N, page_size), dtype=dtype, device=device),
+                torch.empty((N, page_size), dtype=dtype, device=device),
+            ],
+        }
+        peak_nbytes = {name: sum(t.nbytes for t in ts) for name, ts in peaks.items()}
+        dominant = max(peak_nbytes, key=peak_nbytes.get)
+        # Free the non-dominant peak so the CUDA delta reflects only the live one
+        for name in [n for n in peaks if n != dominant]:
+            del peaks[name]
 
         actual_cuda = torch.cuda.memory_allocated(device) - baseline
-        expected_nbytes = sum(t.nbytes for t in tensors)
-        num_allocations = len(tensors)
+        expected_nbytes = sum(t.nbytes for t in fixed) + peak_nbytes[dominant]
+        num_allocations = len(fixed) + len(peaks[dominant])
 
-        del tensors
+        del fixed, peaks
         torch.cuda.empty_cache()
 
         # 1) Exact check: prediction must equal the sum of tensor nbytes. This validates the polynomial
