@@ -593,17 +593,18 @@ class PagedAttentionMemoryHandler:
         peaks = {}
 
         # LM head peak: this is when we turn the hidden states into logits
-        delta_m = self.config.hidden_size * self.activation_dtype  # hidden_shape, shape [M, hidden_size]
+        delta_m = self.config.hidden_size * self.activation_dtype.itemsize  # hidden_shape, shape [M, hidden_size]
         delta_m += self.config.vocab_size * torch.float32.itemsize  # logits, shape [M, V], always in fp32
         peaks["lm_head"] = (delta_m, 0, 0, 0)
 
         # Attention peak: this is when we read the key and value states from the cache
-        delta_m = (
+        delta_m = self.activation_dtype.itemsize * (
             self.config.hidden_size  # hidden state, shape [M, hidden_size]
             + mem_per_q_token  # q_projection, shape [M, mem_per_q_token]
             + 2 * mem_per_k_or_v_token  # new K and V, shape [M, page_size]
         )
-        delta_n = 2 * mem_per_k_or_v_token  # old K and V, read from cache (worst case scenario: whole cache is read)
+        # old K and V, read from cache (worst case scenario: whole cache is read)
+        delta_n = 2 * mem_per_k_or_v_token * self.activation_dtype.itemsize
         peaks["attention"] = (delta_m, delta_n, 0, 0)
 
         return peaks
@@ -666,7 +667,7 @@ class PagedAttentionMemoryHandler:
             solutions.append((m, n))
 
         final_m = min([solution[0] for solution in solutions])
-        final_n = max([solution[1] for solution in solutions])
+        final_n = min([solution[1] for solution in solutions])
         return final_m, final_n
 
     def _solve_for_peak(
@@ -687,17 +688,19 @@ class PagedAttentionMemoryHandler:
                 raise ValueError("m must be provided if num_blocks and max_batch_tokens are None")
             num_pages = self._solve_quadratic(cmn * m + cmm * m**2, cn + cm * m, -self.available_memory)
             max_batch_tokens = int(num_pages * m)
+            num_blocks = int(num_pages) // self.block_size
 
         # Otherwise, use a linear solver
         elif num_blocks is None:
             # M given → linear in N: (coeff_n + coeff_nm·M)·N = avail − coeff_m·M − coeff_mm·M²
             M = max_batch_tokens
             num_pages = floor((self.available_memory - cm * M - cmm * M**2) / (cn + cmn * M))
+            num_blocks = num_pages // self.block_size
 
         elif max_batch_tokens is None:
             # N given → quadratic in M: coeff_mm·M² + (coeff_m + coeff_nm·N)·M + (coeff_n·N − avail) = 0
             N = num_blocks * self.block_size
-            M = self._solve_quadratic(cmm, cm + cmn * N, cn * N - self.available_memory)
+            max_batch_tokens = int(self._solve_quadratic(cmm, cm + cmn * N, cn * N - self.available_memory))
 
         return max_batch_tokens, num_blocks
 
