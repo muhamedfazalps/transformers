@@ -111,7 +111,7 @@ class ContinuousBatchingIOs:
         # Setup other accumulators
         self.requests_in_batch: list[FutureRequestState] = []
         self.req_id_to_new_token_position: dict[str, int] = {}  # only used for async API
-        self.graphs: CudaGraphBuffer = CudaGraphBuffer(continuous_batching_config.max_cached_graphs)
+        self.graphs: CudaGraphBuffer = CudaGraphBuffer()
         self._trash_index = cache.trash_index
         # Setup static tensors and compute stream
         self._setup_static_tensors(logit_processor=logit_processor)
@@ -550,7 +550,6 @@ class ContinuousBatchingIOs:
         graph = self.graphs.get_graph(key)
         # If this point is reached, it means the next step will be a new graph capture
         if graph is None:
-            self.graphs.plan_for_new_graph()
             logger.info(f"Creating graph for {key = }")
         return graph
 
