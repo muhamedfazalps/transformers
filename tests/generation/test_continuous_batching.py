@@ -45,7 +45,11 @@ from transformers.generation.continuous_batching.continuous_api import OutputRou
 from transformers.generation.continuous_batching.distributed import DistributedHelper
 from transformers.generation.continuous_batching.input_outputs import build_attention_mask
 from transformers.generation.continuous_batching.offloading_manager import OffloadingManager
-from transformers.generation.continuous_batching.requests import GenerationOutput, RequestStatus
+from transformers.generation.continuous_batching.requests import (
+    GenerationOutput,
+    RequestStatus,
+    get_device_and_memory_breakdown,
+)
 from transformers.testing_utils import (
     require_deterministic_for_xpu,
     require_flash_attn,
@@ -774,6 +778,48 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
             model_id=model_id,
             continuous_batching_config=continuous_batching_config,
             attn_implementation="sdpa",
+        )
+
+    @with_flush_memory
+    def test_memory_footprint_respects_max_memory_percent(self) -> None:
+        """Runs a short batched generation with an auto-inferred cache size and checks that the real peak memory the
+        cache, IOs and activations add on top of the model stays within the configured max_memory_percent of the free
+        device memory (within a tolerance, to account for allocator rounding and the spare cache blocks)."""
+        if not (torch.cuda.is_available() or is_torch_xpu_available()):
+            self.skipTest("Peak memory tracking requires CUDA or XPU")
+        accelerator = torch.cuda if torch.cuda.is_available() else torch.xpu
+
+        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        max_memory_percent = 0.5
+        tolerance = 0.05
+
+        tokenizer, model = get_tokenizer_and_model(model_id, "sdpa", torch_device, torch.float16)
+        input_ids = get_generation_inputs(_DEFAULT_USER_MESSAGES, tokenizer, for_continuous_batching=True)
+        model.generation_config.max_new_tokens = 20
+        model.generation_config.do_sample = False
+        cb_config = ContinuousBatchingConfig(
+            max_memory_percent=max_memory_percent, use_cuda_graph=False, use_async_batching=False
+        )
+
+        # Budget = max_memory_percent of the free device memory, computed exactly as the memory handler does
+        _, total, reserved, allocated = get_device_and_memory_breakdown()
+        budget = max_memory_percent * (total - max(allocated, reserved))
+
+        # Everything continuous batching allocates (cache + IOs + activations) lives on top of the already-loaded model
+        accelerator.reset_peak_memory_stats()
+        model_footprint = accelerator.memory_allocated()
+        model.generate_batch(
+            inputs=input_ids,
+            generation_config=model.generation_config,
+            continuous_batching_config=cb_config,
+        )
+        cb_footprint = accelerator.max_memory_allocated() - model_footprint
+
+        self.assertLessEqual(
+            cb_footprint,
+            budget * (1 + tolerance),
+            f"Continuous batching peak footprint {cb_footprint / 1024**2:.0f} MB exceeds the {max_memory_percent:.0%} "
+            f"budget of {budget / 1024**2:.0f} MB (+{tolerance:.0%} tolerance)",
         )
 
     def test_continuous_batching_long_generate(self) -> None:
