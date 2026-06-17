@@ -559,9 +559,13 @@ class PagedAttentionMemoryHandler:
         group_types: list[str],
         group_size: int,
     ) -> None:
-        """Initialize the memory handler. `activation_peaks` is a list of `(Δcn, Δcm)` pairs giving the activation memory
-        contributions proportional to N (pages) and M (batch tokens) for each peak. Memory must satisfy the constraint
-        at every peak, so we solve each polynomial independently and take the most restrictive result."""
+        """Initialize the memory handler. Args:
+        - config: the model configuration
+        - continuous_batching_config: the continuous batching configuration
+        - dtype: the data type of the activation and the cache
+        - group_types: the list of all attention group types, formatted as strings
+        - group_size: the size (in layers) of an attention group
+        """
         self.config = config
         self.cb_config = continuous_batching_config
         self.cache_dtype = dtype
@@ -670,10 +674,10 @@ class PagedAttentionMemoryHandler:
 
     def _solve_for_peak(
         self,
-        peak: tuple[int, int],
+        peak: tuple[int, ...],
         max_batch_tokens: int | None,
         num_blocks: int | None,
-        m: float | None,
+        cache_fill_per_batch: float | None,
     ) -> tuple[int, int]:
         """Returns a couple of `(max_batch_tokens, num_blocks)` that satisfy the memory constraint for the given
         activation peak."""
@@ -682,8 +686,9 @@ class PagedAttentionMemoryHandler:
         # If neither variable is defined, use a quadratic solver
         if max_batch_tokens is None and num_blocks is None:
             # Substitute M = m·N → (coeff_nm·m + coeff_mm·m²)·N² + (coeff_n + coeff_m·m)·N − avail = 0
-            if m is None:
+            if cache_fill_per_batch is None:
                 raise ValueError("m must be provided if max_batch_tokens and num_blocks are None")
+            m = cache_fill_per_batch  # as in, m is a substitute for big M, which is max_batch_tokens
             num_pages = self._solve_quadratic(cmn * m + cmm * m**2, cn + cm * m, -self.available_memory)
             max_batch_tokens = int(num_pages * m)
             num_blocks = int(num_pages) // self.block_size
@@ -709,12 +714,14 @@ class PagedAttentionMemoryHandler:
             raise MemoryError(
                 f"Memory footprint {memory_footprint} is more than available memory {self.available_memory}"
             )
+        if max_batch_tokens <= 0 or num_blocks <= 0:
+            raise ValueError(f"Invalid values: max_batch_tokens = {max_batch_tokens}, num_blocks = {num_blocks}")
         return max_batch_tokens, num_blocks
 
     def _solve_quadratic(self, a: float, b: float, c: float) -> int:
         """Largest positive root of a·x² + b·x + c = 0. Falls back to linear when a == 0. Rounded down."""
         if a == 0:
-            return -c / b
+            return int(-c / b)
         discriminant = b**2 - 4 * a * c
         if discriminant < 0:
             raise ValueError(f"No real solution (discriminant = {discriminant})")
