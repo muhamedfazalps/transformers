@@ -48,9 +48,7 @@ def resolve_continuous_batching_config(
     # Look at whether the user explicitly asked for the decode fast path before we assign a default value
     user_requested_decode_path = cb_config.max_blocks_per_request is not None
     # Same for cuda graphs, if the user signals they want CUDA graphs via any padding/cached-graph parameter
-    cuda_graph_requested = any(
-        [cb_config.q_padding_interval_size, cb_config.kv_padding_interval_size]
-    )
+    cuda_graph_requested = any([cb_config.q_padding_interval_size, cb_config.kv_padding_interval_size])
 
     # Resolve missing attributes for which we have hints. Must happen before no-hints resolve.
     resolve_using_hints(cb_config, workload_hints)

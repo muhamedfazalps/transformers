@@ -645,9 +645,7 @@ class PagedAttentionMemoryHandler:
         max_batch_tokens = min(self._default_max_batch_tokens, upper_bound_vram)
         max_batch_tokens = max(max_batch_tokens, self._min_max_batch_tokens)
         # Then solve with that value
-        max_batch_tokens, num_blocks = self._solve_for_peaks(
-            max_batch_tokens, num_blocks, cache_fill_per_batch=None
-        )
+        max_batch_tokens, num_blocks = self._solve_for_peaks(max_batch_tokens, num_blocks, cache_fill_per_batch=None)
         return self._check_footprint(max_batch_tokens, num_blocks)
 
     def _solve_for_peaks(

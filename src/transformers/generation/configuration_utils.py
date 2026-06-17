@@ -1806,7 +1806,7 @@ class ContinuousBatchingConfig:
                 "use_default_compile_configs is deprecated: please use default_compile_level instead. For backwards "
                 f"compatibility, {level_msg}"
             )
-        if self.max_cached_graphs is not None: # Deprecated in 5.13
+        if self.max_cached_graphs is not None:  # Deprecated in 5.13
             logger.warning(
                 "max_cached_graphs is deprecated: maximum number of graph is no longer an issue. Deprecated in 5.13."
             )
